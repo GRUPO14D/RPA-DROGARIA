@@ -261,7 +261,6 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
     df_new = df_new[
         df_new["Nota_num"].notna()
         & (df_new["Valor"] > 0.01)
-        & (df_new["Valor"] < TETO_VALOR_ACEITAVEL)
     ]
 
     return df_new.drop(columns=["Nota_num"])
