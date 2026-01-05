@@ -1,0 +1,29 @@
+Playbook de uso (usuario final)
+
+1) Onde estao os arquivos
+   - Pasta raiz: N:\Matriz-Jds\ARQUIVOS INTEGRACAO DOMINIO\! RPA - DROGARIA
+   - Estrutura: ANO\MES-ANO\NOME DA EMPRESA\RELATORIO RPA - NOME DA EMPRESA\
+   - Exemplos: N:\...\2025\11-2025\DROGARIA LIMEIRA\RELATORIO RPA - DROGARIA LIMEIRA\
+
+2) Coloque os relatorios na pasta da empresa
+   - Relatorio do Domínio: arquivo que contenha "DOMINIO" (ex.: DOMINIO REL. NOTAS FISCAIS EMITIDAS 01-15.xls)
+   - Relatorio da Empresa: arquivo que contenha "EMPRESA" (ex.: EMPRESA REL. NOTAS FISCAIS EMITIDAS 01-15.xls)
+   - Se houver segunda quinzena, deixe os dois arquivos na mesma pasta (01-15 e 16-30). O robo le todos.
+
+3) Como executar
+   - Acesse: N:\Matriz-Jds\ARQUIVOS INTEGRACAO DOMINIO\! RPA - DROGARIA\RPA-DROGARIA
+   - Abra o arquivo: RPA-DROGARIA.exe (dentro dessa pasta)
+   - Na tela, selecione a empresa
+   - Digite o Mes/Ano no formato MM-AAAA (ex.: 11-2025)
+   - Clique em "Gerar Conciliacao" e aguarde a barra de progresso concluir
+
+4) Onde sai o resultado
+   - Na mesma pasta da empresa, em: RELATORIO RPA - NOME DA EMPRESA\Conciliacao\
+   - Nome do arquivo: Conciliacao_NOME_DA_EMPRESA_MM-AAAA.xlsx
+
+5) Conversao automatica
+   - Se os relatorios estiverem em .xls, o robo converte para .xlsx sozinho (cria a subpasta XLSX se precisar).
+
+6) Erros comuns
+   - Mensagem "Pasta nao encontrada": verifique se o Mes/Ano digitado existe na estrutura de pastas.
+   - Mensagem "Arquivos DOMINIO/EMPRESA nao encontrados": confira os nomes; precisam conter "DOMINIO" e "EMPRESA".

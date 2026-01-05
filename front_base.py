@@ -1,53 +1,49 @@
 """
-Front-end padrao Tkinter para RPAs.
-Ler empresas do config.ini ([empresas]) e expor callbacks para RPA e Automacao.
+Front-end simples para conciliação: seletor de empresa, campo Mes/Ano, barra de progresso e popups.
+Sem área de log; notificações via messagebox.
 """
 
 import threading
 import tkinter as tk
-from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
 import configparser
+from utils import resource_path
 
-INI_PATH = Path(__file__).with_name("config.ini")
+INI_PATH = Path(resource_path("config.ini"))
 
 
 class ConfigError(RuntimeError):
-    """Erro simples para configuracao invalida."""
+    pass
 
 
 def carregar_empresas():
     cfg = configparser.ConfigParser()
+    cfg.optionxform = str  # preserva o nome exibido
     if not INI_PATH.exists():
         raise ConfigError(f"Arquivo de configuracao nao encontrado: {INI_PATH}")
     cfg.read(INI_PATH, encoding="utf-8")
-    if "empresas" not in cfg or not cfg["empresas"]:
+    if "EMPRESAS" not in cfg or not cfg["EMPRESAS"]:
         raise ConfigError("Preencha [empresas] no config.ini (codigo = nome)")
     empresas = {}
-    for _, nome in cfg["empresas"].items():
-        empresas[nome] = nome  # usa o nome como display e código
+    for nome_empresa in cfg["EMPRESAS"].keys():
+        # usa a chave como nome exibido; valor e caminho eh usado apenas no backend
+        empresas[nome_empresa] = nome_empresa
     return empresas
 
 
 def carregar_mes_ano_default():
     cfg = configparser.ConfigParser()
+    cfg.optionxform = str
     if INI_PATH.exists():
         cfg.read(INI_PATH, encoding="utf-8")
-    return cfg.get("geral", "mes_ano", fallback="11-2025")
+    return cfg.get("GERAL", "MES_ANO", fallback="11-2025")
 
 
 class StatusWindow:
-    """
-    UI padrao para acompanhar execucao do RPA.
-    Passe callbacks on_rpa(codigo, display) e on_automation(codigo, display).
-    """
-
-    def __init__(self, root, on_rpa, on_automation, titulo="Robo RPA"):
+    def __init__(self, root, on_rpa, titulo="Conciliacao"):
         self.root = root
         self.on_rpa = on_rpa
-        self.on_automation = on_automation
 
         self.empresas = carregar_empresas()
         displays = list(self.empresas.keys())
@@ -56,47 +52,38 @@ class StatusWindow:
 
         self.root.title(titulo)
         self.root.geometry("")
-        self.root.minsize(700, 520)
+        self.root.minsize(400, 250)
 
-        self.main_label = ttk.Label(root, text="Aguardando inicio...", font=("Segoe UI", 12, "bold"))
+        self.main_label = ttk.Label(root, text="Aguardando inicio...", font=("Segoe UI", 11, "bold"))
         self.main_label.pack(pady=(10, 5))
 
         ttk.Label(root, text="Selecionar Empresa:").pack(pady=(5, 0))
         self.empresa_selector = ttk.Combobox(
-            root, values=displays, textvariable=self.selected_empresa, state="readonly", width=40, justify="center"
+            root, values=displays, textvariable=self.selected_empresa, state="readonly", width=30, justify="center"
         )
-        self.empresa_selector.pack(pady=(0, 10), anchor="center")
+        self.empresa_selector.pack(pady=(0, 8), anchor="center")
 
-        ttk.Label(root, text="Mes/Ano (MM-AAAA):").pack(pady=(0, 0))
-        self.mes_ano_entry = ttk.Entry(root, textvariable=self.mes_ano_var, width=10, justify="center")
+        ttk.Label(root, text="Selecione a pasta (MM/AAAA):").pack(pady=(0, 0))
+        self.mes_ano_entry = ttk.Entry(root, textvariable=self.mes_ano_var, width=12, justify="center")
         self.mes_ano_entry.pack(pady=(0, 10))
 
-        ttk.Label(root, text="Progresso da Analise de Dados").pack(pady=(5, 0))
-        self.overall_progress = ttk.Progressbar(root, orient="horizontal", length=600, mode="determinate")
+        ttk.Label(root, text="Progresso").pack(pady=(5, 0))
+        self.overall_progress = ttk.Progressbar(root, orient="horizontal", length=300, mode="determinate")
         self.overall_progress.pack(padx=20)
-
-        ttk.Label(root, text="Log de Atividades:").pack(pady=(10, 0))
-        self.log_area = ScrolledText(root, wrap=tk.WORD, width=78, height=10)
-        self.log_area.pack(pady=5, padx=10, fill="both", expand=False)
-        # Permite copiar (Ctrl+C) e selecionar (Ctrl+A), bloqueia edicao
-        self.log_area.bind("<Control-c>", self._copy_log)
-        self.log_area.bind("<Control-a>", self._select_all_log)
-        self.log_area.bind("<Key>", lambda e: "break")
 
         self.button_frame = ttk.Frame(root)
         self.button_frame.pack(pady=(10, 10))
 
         self.start_rpa_button = ttk.Button(
-            self.button_frame, text="Iniciar RPA", command=self.start_rpa, width=20
+            self.button_frame, text="Gerar Conciliacao", command=self.start_rpa, width=20
         )
         self.start_rpa_button.pack(side="left", padx=10)
 
         self.close_button = ttk.Button(
-            self.button_frame, text="Fechar", command=self.root.destroy, state="disabled", width=20
+            self.button_frame, text="Fechar", command=self.root.destroy, state="normal", width=20
         )
-        self.close_button.pack(side="bottom", padx=10)
+        self.close_button.pack(side="right", padx=10)
 
-    # --- Helpers UI thread-safe -------------------------------------------------
     def _ui(self, func, *args, **kwargs):
         self.root.after(0, func, *args, **kwargs)
 
@@ -108,98 +95,52 @@ class StatusWindow:
         self._ui(lambda: self.start_rpa_button.config(state="normal"))
         self._ui(lambda: self.close_button.config(state="normal"))
 
-    # --- Acoes de botao ---------------------------------------------------------
     def start_rpa(self):
         self._lock_buttons()
         display = self.empresa_selector.get()
         codigo = self.empresas[display]
         mes_ano = self.get_mes_ano()
-        self.add_log_message(f"Iniciando RPA para: {display} ({mes_ano})")
+        self.update_main_label(f"Iniciando {display} ({mes_ano})")
         threading.Thread(target=self._wrap(self.on_rpa, codigo, display, mes_ano), daemon=True).start()
-
-    def start_automation(self):
-        self._lock_buttons()
-        display = self.empresa_selector.get()
-        codigo = self.empresas[display]
-        mes_ano = self.get_mes_ano()
-        self.add_log_message(f"Iniciando automacao para: {display} ({mes_ano})")
-        threading.Thread(target=self._wrap(self.on_automation, codigo, display, mes_ano), daemon=True).start()
 
     def _wrap(self, target, codigo, display, mes_ano):
         def runner():
             try:
                 target(codigo, display, mes_ano)
             except Exception as exc:
-                self.add_log_message(f"[ERRO] {exc}")
+                self.show_popup(f"ERRO: {exc}")
             finally:
                 self._unlock_buttons()
         return runner
 
-    # --- API para atualizar UI --------------------------------------------------
     def update_main_label(self, message):
         self._ui(lambda: self.main_label.config(text=message))
 
     def update_progress(self, bar, value):
         self._ui(lambda: bar.config(value=value))
 
-    def add_log_message(self, message):
-        def append():
-            self.log_area.insert(tk.END, f"{datetime.now():%H:%M:%S} - {message}\n")
-            self.log_area.see(tk.END)
-        self._ui(append)
-
     def finalize(self):
         self.update_main_label("Processo finalizado!")
         self._unlock_buttons()
 
-    def enable_automation_button(self):
-        self._ui(self.start_automation_button.config, state="normal")
-
     def get_mes_ano(self):
         return self.mes_ano_var.get().strip()
 
-    def show_automation_alert(self):
-        self._ui(
-            messagebox.showinfo,
-            "Automacao iniciada",
-            "Clique em OK e mantenha o Dominio em foco. Nao use o computador ate concluir.",
-        )
-
-    def _copy_log(self, event=None):
-        try:
-            text = self.log_area.selection_get()
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
-        except Exception:
-            pass
-        return "break"
-
-    def _select_all_log(self, event=None):
-        self.log_area.tag_add("sel", "1.0", "end")
-        return "break"
+    def show_popup(self, message, title="Aviso"):
+        self._ui(messagebox.showinfo, title, message)
 
 
-def criar_janela(on_rpa, on_automation, titulo="Robo RPA"):
+def criar_janela(on_rpa, titulo="Conciliacao Dominio x Empresa"):
     root = tk.Tk()
-    app = StatusWindow(root, on_rpa, on_automation, titulo=titulo)
+    app = StatusWindow(root, on_rpa, titulo=titulo)
     return root, app
 
 
 if __name__ == "__main__":
-    # Exemplo rapido
-    def dummy_rpa(codigo, display):  # pragma: no cover - demo manual
-        import time
-
-        time.sleep(1)
-        app.add_log_message(f"Rodou analise para {display} ({codigo})")
+    def dummy_rpa(codigo, display, mes_ano):  # pragma: no cover
+        app.update_progress(app.overall_progress, 50)
+        app.show_popup(f"Rodou {display} ({mes_ano})")
         app.finalize()
 
-    def dummy_auto(codigo, display):  # pragma: no cover - demo manual
-        import time
-
-        time.sleep(1)
-        app.add_log_message(f"Rodou automacao para {display} ({codigo})")
-        app.finalize()
-
-    root, app = criar_janela(dummy_rpa, dummy_auto, titulo="Demo RPA")
+    root, app = criar_janela(dummy_rpa, titulo="Demo")
     root.mainloop()

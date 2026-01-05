@@ -4,24 +4,94 @@ import sys
 import shutil
 import tempfile
 import subprocess
+import configparser
+from utils import resource_path
 from pathlib import Path
-from typing import Callable, Optional, List
+from typing import Callable, Optional, List, Dict
 
 import pandas as pd
 
-# Config padrao
-MES_ANO_DEFAULT = "11-2025"
-TETO_VALOR_ACEITAVEL = 5_000_000.00
+# --- Config carregada do config.ini ---
+CFG_PATH = Path(resource_path("config.ini"))
+CFG = configparser.ConfigParser()
+CFG.optionxform = str  # preserva maiusculas/minusculas das chaves
+if CFG_PATH.exists():
+    CFG.read(CFG_PATH, encoding="utf-8")
 
-BASES_TEMPLATE = [
-    r"N:\Matriz-Jds\Arquivos NF-e\{ano}\{mes_ano}",
-    r"N:\Arquivos NF-e\{ano}\{mes_ano}",
-    r"N:\{ano}\{mes_ano}",
-]
+# Config padrao (sobrescrito pelo ini quando presente)
+MES_ANO_DEFAULT = CFG.get("GERAL", "MES_ANO", fallback="11-2025")
+DIR_SAIDA_RPA = CFG.get("GERAL", "ARQUIVOS_GLOBAIS", fallback=CFG.get("GERAL", "PASTA_BASE", fallback=r"V:\Fiscal\RPA"))
 
-DIR_SAIDA_RPA = r"V:\Fiscal\RPA"
-KEYWORD_DOMINIO = "DOMINIO"
-KEYWORD_EMPRESA = "EMPRESA"
+# Bases de busca para as empresas (suporta uso de {ano} e {mes_ano})
+BASES_TEMPLATE = [v for _, v in CFG.items("caminhos_base")] if CFG.has_section("caminhos_base") else []
+
+# Estrutura de relatorios
+SUBPASTA_RELATORIO = CFG.get(
+    "estrutura_relatorios", "subpasta_relatorio", fallback=r""
+)
+
+# Palavras-chave para identificar arquivos
+def _keyword_from_cfg(cfg_value: str, default: str) -> str:
+    if not cfg_value:
+        return default
+    u = cfg_value.upper()
+    if "DOMINIO" in u:
+        return "DOMINIO"
+    if "EMPRESA" in u and default == "EMPRESA":
+        return "EMPRESA"
+    return default
+
+
+KEYWORD_DOMINIO = _keyword_from_cfg(CFG.get("estrutura_relatorios", "arquivo_dominio", fallback=""), "DOMINIO")
+KEYWORD_EMPRESA = _keyword_from_cfg(CFG.get("estrutura_relatorios", "arquivo_empresa", fallback=""), "EMPRESA")
+
+# --- Helpers de config (novo .ini) ---
+def _expand_vars(value: str, empresa: str = "", mes_ano: str = "") -> str:
+    if not value:
+        return value
+    ctx: Dict[str, str] = {}
+    if CFG.has_section("GERAL"):
+        for k, v in CFG["GERAL"].items():
+            ctx[k.lower()] = v
+    ctx["empresa"] = empresa
+    ctx["mes_ano"] = mes_ano
+    ctx["ano"] = extrair_ano(mes_ano)
+    try:
+        return value.format(**{k.upper(): v for k, v in ctx.items()}, **ctx)
+    except Exception:
+        try:
+            return value.format(**ctx)
+        except Exception:
+            return value
+
+
+def carregar_empresas_cfg(mes_ano: str) -> Dict[str, Dict[str, str]]:
+    """
+    Retorna dict: nome -> {base_dir, arquivo_dom, arquivo_emp}
+    Usa seções [EMPRESAS], [PADROES] e [PADROES.<NOME>].
+    """
+    if not CFG.has_section("EMPRESAS"):
+        return {}
+
+    base_padrao_dom = CFG.get("PADROES", "ARQUIVO_DOMINIO", fallback="")
+    base_padrao_emp = CFG.get("PADROES", "ARQUIVO_EMPRESA", fallback="")
+
+    empresas_cfg: Dict[str, Dict[str, str]] = {}
+    for nome, caminho in CFG["EMPRESAS"].items():
+        nome_limpo = nome.strip()
+        base_dir = _expand_vars(caminho, empresa=nome_limpo, mes_ano=mes_ano)
+
+        sec_esp = f"PADROES.{nome_limpo}"
+        arq_dom = CFG.get(sec_esp, "ARQUIVO_DOMINIO", fallback=base_padrao_dom)
+        arq_emp = CFG.get(sec_esp, "ARQUIVO_EMPRESA", fallback=base_padrao_emp)
+
+        empresas_cfg[nome_limpo] = {
+            "base_dir": base_dir,
+            "arquivo_dom": _expand_vars(arq_dom, empresa=nome_limpo, mes_ano=mes_ano),
+            "arquivo_emp": _expand_vars(arq_emp, empresa=nome_limpo, mes_ano=mes_ano),
+        }
+    return empresas_cfg
+
 
 LIBREOFFICE_CANDIDATOS = [
     r"C:\Program Files\LibreOffice\program\soffice.exe",
@@ -275,20 +345,67 @@ def extrair_ano(mes_ano: str) -> str:
 
 def resolver_bases(mes_ano: str) -> List[str]:
     ano = extrair_ano(mes_ano)
-    return [tmpl.format(ano=ano, mes_ano=mes_ano) for tmpl in BASES_TEMPLATE]
+    if not BASES_TEMPLATE:
+        return []
+    resolved = []
+    for tmpl in BASES_TEMPLATE:
+        try:
+            resolved.append(tmpl.format(ano=ano, mes_ano=mes_ano))
+        except Exception:
+            resolved.append(tmpl)
+    return resolved
 
 
-def processar_empresa(empresa: str, pasta_base: str, mes_ano: str):
+def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: Optional[str] = None, arquivo_emp: Optional[str] = None):
     log(f"Empresa: {empresa}")
-    pasta_relatorio = f"RELATORIO RPA - {empresa}"
-    path_rpa = Path(pasta_base) / empresa / "ESCRITA FISCAL" / pasta_relatorio
+    # Calcula caminho da pasta que contem os relatorios para a empresa.
+    # Se SUBPASTA_RELATORIO tiver placeholder {empresa}, usa diretamente.
+    # Caso contrario, adiciona "RELATORIO RPA - {empresa}" ao final.
+    try:
+        sub_rel_str = SUBPASTA_RELATORIO.format(empresa=empresa)
+    except Exception:
+        sub_rel_str = SUBPASTA_RELATORIO
+
+    if not sub_rel_str:
+        sub_rel_path = Path(".")
+    else:
+        sub_rel_path = Path(sub_rel_str)
+        if "{empresa}" not in SUBPASTA_RELATORIO and "RELATORIO RPA" not in sub_rel_path.name.upper():
+            sub_rel_path = sub_rel_path / f"RELATORIO RPA - {empresa}"
+
+    base_path = Path(pasta_base)
+    if (base_path / empresa).exists():
+        base_path = base_path / empresa
+    path_rpa = base_path / sub_rel_path
 
     if not path_rpa.exists():
         log("[PULADO] Pasta nao encontrada.")
         return
 
+    # Garante pasta XLSX para conversoes.
+    xlsx_dir = path_rpa / "XLSX"
+    xlsx_dir.mkdir(exist_ok=True)
+
     dom_candidates = []
     emp_candidates = []
+
+    def tentar_adicionar_por_nome(arq_nome: Optional[str], destino: list):
+        if not arq_nome:
+            return
+        alvo = path_rpa / arq_nome
+        if alvo.exists():
+            destino.append(alvo)
+        else:
+            # tenta procurar por nome exato dentro da pasta (qualquer subpasta direta)
+            for f in path_rpa.glob("**/*"):
+                if f.is_file() and f.name.lower() == arq_nome.lower():
+                    destino.append(f)
+                    break
+
+    tentar_adicionar_por_nome(arquivo_dom, dom_candidates)
+    tentar_adicionar_por_nome(arquivo_emp, emp_candidates)
+
+    # Se nao achar pelos nomes especificos, recorre ao padrao por keyword
     for f in path_rpa.iterdir():
         if f.name.startswith("~$"):
             continue
@@ -345,8 +462,10 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str):
         log("[ERRO] Dados insuficientes.")
         return
 
-    os.makedirs(DIR_SAIDA_RPA, exist_ok=True)
-    fout = Path(DIR_SAIDA_RPA) / f"Conciliacao_{empresa.replace(' ', '_')}_{mes_ano}.xlsx"
+    # Saida agora na pasta da empresa: .../RELATORIO RPA - <empresa>/Conciliacao
+    out_dir = path_rpa / "Conciliacao"
+    os.makedirs(out_dir, exist_ok=True)
+    fout = out_dir / f"Conciliacao_{empresa.replace(' ', '_')}_{mes_ano}.xlsx"
 
     try:
         with pd.ExcelWriter(fout, engine="xlsxwriter") as writer:
@@ -395,6 +514,33 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str):
 
 def run_conciliacao(mes_ano: str, empresas: List[str]):
     log(f"Iniciando conciliacao [{mes_ano}]")
+
+    empresas_cfg = carregar_empresas_cfg(mes_ano)
+
+    # Se ini define empresas com caminhos especificos, usa eles.
+    if empresas_cfg:
+        alvo = empresas or list(empresas_cfg.keys())
+        for emp in alvo:
+            conf = empresas_cfg.get(emp)
+            if not conf:
+                log(f"[PULADO] Empresa nao configurada no ini: {emp}")
+                continue
+            base_dir = conf.get("base_dir") or ""
+            if not base_dir:
+                log(f"[PULADO] Base nao informada para {emp}")
+                continue
+            log(f"Base: {base_dir}")
+            processar_empresa(
+                emp,
+                base_dir,
+                mes_ano,
+                arquivo_dom=conf.get("arquivo_dom"),
+                arquivo_emp=conf.get("arquivo_emp"),
+            )
+        log("Fim")
+        return
+
+    # Fallback antigo (usa caminhos_base + subpastas)
     base = None
     for p in resolver_bases(mes_ano):
         if os.path.exists(p):
@@ -412,6 +558,8 @@ def run_conciliacao(mes_ano: str, empresas: List[str]):
 if __name__ == "__main__":
     mes_ano_cli = sys.argv[1] if len(sys.argv) > 1 else MES_ANO_DEFAULT
     empresas_cli = sys.argv[2:] if len(sys.argv) > 2 else []
+    if not empresas_cli and CFG.has_section("empresas"):
+        empresas_cli = list(CFG["empresas"].values())
     if not empresas_cli:
         empresas_cli = ["DROGARIA LIMEIRA", "DROGARIA MORELLI FILIAL", "DROGARIA MORELLI MTZ"]
     run_conciliacao(mes_ano_cli, empresas_cli)
