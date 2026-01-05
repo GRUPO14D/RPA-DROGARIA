@@ -7,6 +7,7 @@ import subprocess
 import configparser
 from utils import resource_path
 from pathlib import Path
+from numbers import Integral
 from typing import Callable, Optional, List, Dict
 
 import pandas as pd
@@ -267,19 +268,43 @@ def cortar_inicio(df: pd.DataFrame, col_nota_idx: int) -> pd.DataFrame:
 
 def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
     """
-    Titulos na linha 6 (indice 5).
+    Detecta cabecalho e recorta colunas relevantes.
     Dom: Nota col 4, Valor col 20, Data col 2
-    Emp: Nota col 12, Valor col 17, Data col 10
+    Emp: Nota col 12, Valor col 17, Data col 10, Status Nfe (quando existir)
     """
     if df_raw is None or df_raw.empty:
-        return pd.DataFrame(columns=["Nota", "Valor"])
+        return pd.DataFrame(columns=["Nota", "Valor", "Data", "Codigo", "Status_NFE"])
 
-    if isinstance(df_raw.columns[0], int):
+    def _find_header_row(df: pd.DataFrame, must_have: List[str], max_rows: int = 30) -> Optional[int]:
+        lim = min(max_rows, len(df))
+        for i in range(lim):
+            row = df.iloc[i].astype(str).str.lower()
+            if all(row.str.contains(t, na=False, regex=False).any() for t in must_have):
+                return i
+        return None
+
+    if isinstance(df_raw.columns[0], Integral):
+        # Alguns relatórios do Domínio vêm com cabeçalho em linha fixa (5),
+        # e alguns relatórios de Empresa trazem cabeçalho por volta da linha 3.
         if len(df_raw) <= 6:
             log("[ERRO] Planilha sem linhas suficientes para cabecalho")
-            return pd.DataFrame(columns=["Codigo", "Nota", "Valor"])
-        df_raw.columns = df_raw.iloc[5].astype(str).str.lower().str.strip()
-        df_raw = df_raw.iloc[6:].reset_index(drop=True)
+            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+
+        if tipo_origem == "EMPRESA":
+            header_idx = _find_header_row(df_raw, must_have=["n.nota", "status nfe"], max_rows=20)
+            if header_idx is None:
+                header_idx = _find_header_row(df_raw, must_have=["n.nota", "status"], max_rows=25)
+            if header_idx is None:
+                header_idx = _find_header_row(df_raw, must_have=["nota", "status"], max_rows=25)
+            if header_idx is None:
+                header_idx = 5
+        else:
+            header_idx = _find_header_row(df_raw, must_have=["nota", "valor"], max_rows=20)
+            if header_idx is None:
+                header_idx = 5
+
+        df_raw.columns = df_raw.iloc[header_idx].astype(str).str.lower().str.strip()
+        df_raw = df_raw.iloc[header_idx + 1 :].reset_index(drop=True)
     else:
         df_raw.columns = df_raw.columns.astype(str).str.lower().str.strip()
 
@@ -290,18 +315,19 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
     if tipo_origem == "DOMINIO":
         if len(df_raw.columns) <= 22:
             log("[ERRO] DOMINIO: colunas insuficientes")
-            return pd.DataFrame(columns=["Codigo", "Nota", "Valor"])
+            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
         col_nota = df_raw.columns[4]
         col_valor = df_raw.columns[20]
         col_data = df_raw.columns[2]
         col_cod = None
+        col_status = None
         df_raw = cortar_inicio(df_raw, df_raw.columns.get_loc(col_nota))
         valor_series = df_raw[col_valor]
         data_series = parse_data(df_raw[col_data])
     else:
         if len(df_raw.columns) <= 17:
             log("[ERRO] EMPRESA: colunas insuficientes")
-            return pd.DataFrame(columns=["Codigo", "Nota", "Valor"])
+            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
         col_nota = df_raw.columns[12]
         col_valor = df_raw.columns[17]
         col_data = df_raw.columns[10]
@@ -309,6 +335,10 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
         df_raw = cortar_inicio(df_raw, df_raw.columns.get_loc(col_nota))
         valor_series = df_raw[col_valor]
         data_series = parse_data(df_raw[col_data])
+        col_status = next(
+            (c for c in df_raw.columns if isinstance(c, str) and "status" in c and "nfe" in c),
+            None,
+        )
 
     try:
         df_new = pd.DataFrame({
@@ -320,9 +350,13 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
             df_new["Codigo"] = df_raw[col_cod]
         else:
             df_new["Codigo"] = ""
+        if col_status:
+            df_new["Status_NFE"] = df_raw[col_status]
+        else:
+            df_new["Status_NFE"] = ""
     except Exception as exc:
         log(f"[ERRO] Recorte de colunas: {exc}")
-        return pd.DataFrame(columns=["Codigo", "Nota", "Valor"])
+        return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
 
     df_new["Nota"] = df_new["Nota"].apply(normalizar_nota)
     df_new["Valor"] = df_new["Valor"].apply(converter_para_float)
@@ -473,6 +507,20 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
             df_e_g = df_e.drop_duplicates(subset="Nota", keep="first") if not df_e.empty else pd.DataFrame(columns=["Nota", "Valor", "Codigo"])
             log(f"Notas lidas Dom/Emp: {len(df_d_g)} / {len(df_e_g)}")
 
+            # Se a empresa tem Status NFE, separa notas inutilizadas (ex.: "I") em aba dedicada.
+            df_inutilizadas = pd.DataFrame()
+            if "Status_NFE" in df_e_g.columns and not df_e_g.empty:
+                status_norm = df_e_g["Status_NFE"].astype(str).str.strip().str.upper()
+                mask_inut = status_norm.eq("I") | status_norm.str.startswith("I ")
+                if mask_inut.any():
+                    df_inutilizadas = df_e_g.loc[mask_inut].copy()
+                    df_e_g = df_e_g.loc[~mask_inut].copy()
+
+                    notas_inut = set(df_inutilizadas["Nota"].astype(str))
+                    if "Nota" in df_d_g.columns and not df_d_g.empty:
+                        df_d_g = df_d_g.loc[~df_d_g["Nota"].astype(str).isin(notas_inut)].copy()
+                    log(f"Notas inutilizadas (empresa): {len(df_inutilizadas)}")
+
             df_final = pd.merge(df_d_g, df_e_g, on="Nota", how="outer", suffixes=("_Dom", "_Emp"), indicator=True)
             df_final["Valor_Dom"] = df_final["Valor_Dom"].fillna(0.0)
             df_final["Valor_Emp"] = df_final["Valor_Emp"].fillna(0.0)
@@ -507,6 +555,23 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
             ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "Divergencia", "format": fmt_r})
             ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "So Dominio", "format": fmt_y})
             ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "So Empresa", "format": fmt_b})
+
+            if not df_inutilizadas.empty:
+                cols_inut = ["Codigo", "Nota", "Data", "Valor", "Status_NFE"]
+                df_inut_out = df_inutilizadas[[c for c in cols_inut if c in df_inutilizadas.columns]].copy()
+                try:
+                    df_inut_out["k"] = pd.to_numeric(df_inut_out["Nota"], errors="coerce")
+                    df_inut_out.sort_values("k", inplace=True)
+                    df_inut_out.drop(columns="k", inplace=True)
+                except Exception:
+                    pass
+                df_inut_out.to_excel(writer, index=False, sheet_name="Inutilizadas")
+                ws2 = writer.sheets["Inutilizadas"]
+                ws2.set_column("A:A", 12)
+                ws2.set_column("B:B", 12)
+                ws2.set_column("C:C", 14)
+                ws2.set_column("D:D", 18, fmt_m)
+                ws2.set_column("E:E", 12)
         log(f"Consolidado salvo: {fout}")
     except Exception as exc:
         log(f"[ERRO SALVAR] {exc}")
