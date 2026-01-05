@@ -504,9 +504,28 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
     try:
         with pd.ExcelWriter(fout, engine="xlsxwriter") as writer:
             wb = writer.book
-            fmt_header = wb.add_format({"bold": True, "bg_color": "#D9E1F2", "border": 1, "text_wrap": True})
-            fmt_text = wb.add_format({"text_wrap": True})
-            fmt_date = wb.add_format({"num_format": "dd/mm/yyyy"})
+            fmt_header = wb.add_format(
+                {
+                    "bold": True,
+                    "bg_color": "#D9E1F2",
+                    "border": 1,
+                    "text_wrap": True,
+                    "align": "center",
+                    "valign": "vcenter",
+                }
+            )
+            fmt_text = wb.add_format({"text_wrap": True, "align": "center", "valign": "vcenter"})
+            fmt_date = wb.add_format({"num_format": "dd/mm/yyyy", "align": "center", "valign": "vcenter"})
+            fmt_m = wb.add_format({"num_format": "#,##0.00", "align": "center", "valign": "vcenter"})
+            fmt_r = wb.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006", "align": "center", "valign": "vcenter"})
+            fmt_y = wb.add_format({"bg_color": "#FFEB9C", "font_color": "#9C6500", "align": "center", "valign": "vcenter"})
+            fmt_b = wb.add_format({"bg_color": "#BDD7EE", "font_color": "#000000", "align": "center", "valign": "vcenter"})
+
+            # Ordem das abas: Resumo -> Conciliacao Completa -> Inutilizadas
+            ws_r = wb.add_worksheet("Resumo")
+            ws = wb.add_worksheet("Conciliacao Completa")
+            writer.sheets["Resumo"] = ws_r
+            writer.sheets["Conciliacao Completa"] = ws
             df_d_g = df_d.drop_duplicates(subset="Nota", keep="first") if not df_d.empty else pd.DataFrame(columns=["Nota", "Valor", "Codigo"])
             df_e_g = df_e.drop_duplicates(subset="Nota", keep="first") if not df_e.empty else pd.DataFrame(columns=["Nota", "Valor", "Codigo"])
             log(f"Notas lidas Dom/Emp: {len(df_d_g)} / {len(df_e_g)}")
@@ -566,27 +585,6 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
             except Exception:
                 df_final.sort_values("Nota", inplace=True)
 
-            df_final.to_excel(writer, index=False, sheet_name="Resultado")
-            ws = writer.sheets["Resultado"]
-            fmt_m = wb.add_format({"num_format": "#,##0.00"})
-            fmt_r = wb.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006"})
-            fmt_y = wb.add_format({"bg_color": "#FFEB9C", "font_color": "#9C6500"})
-            fmt_b = wb.add_format({"bg_color": "#BDD7EE", "font_color": "#000000"})
-            ws.set_row(0, 22)
-            for col_idx, col_name in enumerate(df_final.columns.tolist()):
-                ws.write(0, col_idx, col_name, fmt_header)
-            ws.freeze_panes(1, 0)
-            ws.autofilter(0, 0, max(0, len(df_final)), max(0, len(df_final.columns) - 1))
-
-            ws.set_column("A:A", 14)
-            ws.set_column("B:B", 12)
-            ws.set_column("C:E", 18, fmt_m)
-            ws.set_column("F:F", 22, fmt_text)
-            ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "Divergencia", "format": fmt_r})
-            ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "So Dominio", "format": fmt_y})
-            ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "So Empresa", "format": fmt_b})
-            ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "Inutilizada", "format": fmt_b})
-
             # Aba de resumo para leitura rápida
             total_resultado = len(df_final)
             qtd_inutilizadas = int((df_final["Status"] == "Inutilizada").sum()) if "Status" in df_final.columns else 0
@@ -599,7 +597,7 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
                 [
                     ["Empresa", empresa],
                     ["Mes/Ano", mes_ano],
-                    ["Notas (Resultado)", total_resultado],
+                    ["Notas (Conciliacao Completa)", total_resultado],
                     ["Inutilizadas", qtd_inutilizadas],
                     ["So Empresa", qtd_so_empresa],
                     ["So Dominio", qtd_so_dominio],
@@ -610,7 +608,6 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
                 columns=["Item", "Valor"],
             )
             df_resumo.to_excel(writer, index=False, sheet_name="Resumo")
-            ws_r = writer.sheets["Resumo"]
             ws_r.set_row(0, 22)
             ws_r.write(0, 0, "Item", fmt_header)
             ws_r.write(0, 1, "Valor", fmt_header)
@@ -619,7 +616,26 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
             ws_r.set_column("A:A", 28, fmt_text)
             ws_r.set_column("B:B", 40, fmt_text)
 
+            # Aba principal (conciliacao completa)
+            df_final.to_excel(writer, index=False, sheet_name="Conciliacao Completa")
+            ws.set_row(0, 22)
+            for col_idx, col_name in enumerate(df_final.columns.tolist()):
+                ws.write(0, col_idx, col_name, fmt_header)
+            ws.freeze_panes(1, 0)
+            ws.autofilter(0, 0, max(0, len(df_final)), max(0, len(df_final.columns) - 1))
+
+            ws.set_column("A:A", 14, fmt_text)
+            ws.set_column("B:B", 12, fmt_text)
+            ws.set_column("C:E", 18, fmt_m)
+            ws.set_column("F:F", 22, fmt_text)
+            ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "Divergencia", "format": fmt_r})
+            ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "So Dominio", "format": fmt_y})
+            ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "So Empresa", "format": fmt_b})
+            ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "Inutilizada", "format": fmt_b})
+
             if not df_inutilizadas.empty:
+                ws2 = wb.add_worksheet("Inutilizadas")
+                writer.sheets["Inutilizadas"] = ws2
                 cols_inut = ["Codigo", "Nota", "Data", "Valor", "Status_NFE"]
                 df_inut_out = df_inutilizadas[[c for c in cols_inut if c in df_inutilizadas.columns]].copy()
                 try:
@@ -629,14 +645,13 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
                 except Exception:
                     pass
                 df_inut_out.to_excel(writer, index=False, sheet_name="Inutilizadas")
-                ws2 = writer.sheets["Inutilizadas"]
                 ws2.set_row(0, 22)
                 for col_idx, col_name in enumerate(df_inut_out.columns.tolist()):
                     ws2.write(0, col_idx, col_name, fmt_header)
                 ws2.freeze_panes(1, 0)
                 ws2.autofilter(0, 0, max(0, len(df_inut_out)), max(0, len(df_inut_out.columns) - 1))
-                ws2.set_column("A:A", 14)
-                ws2.set_column("B:B", 12)
+                ws2.set_column("A:A", 14, fmt_text)
+                ws2.set_column("B:B", 12, fmt_text)
                 ws2.set_column("C:C", 14, fmt_date)
                 ws2.set_column("D:D", 18, fmt_m)
                 ws2.set_column("E:E", 12, fmt_text)
