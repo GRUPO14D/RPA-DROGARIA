@@ -158,10 +158,11 @@ def normalizar_nota(nota):
 def preencher_mesclados(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
-    try:
-        return df.ffill()
-    except Exception:
-        return df
+    # Atenção: forward-fill ("ffill") em relatórios do Domínio/Empresa pode "colar" o número da Nota
+    # nas linhas de TOTAL/rodapé (onde a coluna Nota vem vazia), fazendo esses totais entrarem na conciliação.
+    # Preferimos não preencher automaticamente; as colunas usadas (Nota/Valor/Data/Status) já são lidas das linhas
+    # válidas e as linhas de total são descartadas pelo parser.
+    return df
 
 
 def parse_data(col) -> pd.Series:
