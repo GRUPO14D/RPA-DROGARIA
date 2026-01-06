@@ -355,10 +355,13 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
         df_raw = cortar_inicio(df_raw, df_raw.columns.get_loc(col_nota))
         valor_series = df_raw[col_valor]
         data_series = parse_data(df_raw[col_data])
-        col_status = next(
-            (c for c in df_raw.columns if isinstance(c, str) and "status" in c and "nfe" in c),
-            None,
-        )
+        # Status NFe fica na coluna U (indice 20) no relatório Empresa.
+        col_status = df_raw.columns[20] if len(df_raw.columns) > 20 else None
+        if col_status is None:
+            col_status = next(
+                (c for c in df_raw.columns if isinstance(c, str) and "status" in c and "nfe" in c),
+                None,
+            )
 
     try:
         df_new = pd.DataFrame({
