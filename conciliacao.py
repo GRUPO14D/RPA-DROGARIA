@@ -341,11 +341,12 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
             (c for c in df_raw.columns if isinstance(c, str) and "n.nota" in c),
             None,
         ) or df_raw.columns[12]
-        # Preferência: "Total Produtos" (coluna Q) ao invés de "Total Nota"
-        col_valor = next(
-            (c for c in df_raw.columns if isinstance(c, str) and "total produtos" in c),
-            None,
-        ) or (df_raw.columns[16] if len(df_raw.columns) > 16 else df_raw.columns[17])
+        # Preferência: "Total Nota" (valor total do documento). Se não existir, tenta "Total Produtos".
+        col_valor = (
+            next((c for c in df_raw.columns if isinstance(c, str) and "total nota" in c), None)
+            or next((c for c in df_raw.columns if isinstance(c, str) and "total produtos" in c), None)
+            or (df_raw.columns[17] if len(df_raw.columns) > 17 else df_raw.columns[-1])
+        )
         col_data = next(
             (c for c in df_raw.columns if isinstance(c, str) and ("dt.emiss" in c or "dt.emissão" in c)),
             None,
