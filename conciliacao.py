@@ -519,6 +519,31 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
         log("[ERRO] Dados insuficientes.")
         return
 
+    def agregar_por_nota(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+        out = df.copy()
+        for c in ["Codigo", "Nota", "Valor", "Data", "Status_NFE"]:
+            if c not in out.columns:
+                out[c] = ""
+
+        def first_non_empty(series: pd.Series):
+            for v in series:
+                if pd.notna(v) and str(v).strip() != "":
+                    return v
+            return ""
+
+        grouped = (
+            out.groupby("Nota", as_index=False)
+            .agg(
+                Valor=("Valor", "sum"),
+                Data=("Data", "min"),
+                Codigo=("Codigo", first_non_empty),
+                Status_NFE=("Status_NFE", first_non_empty),
+            )
+        )
+        return grouped[["Codigo", "Nota", "Valor", "Data", "Status_NFE"]]
+
     # Saida agora na pasta da empresa: .../RELATORIO RPA - <empresa>/Conciliacao
     out_dir = path_rpa / "Conciliacao"
     os.makedirs(out_dir, exist_ok=True)
@@ -549,13 +574,16 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
             ws = wb.add_worksheet("Conciliacao Completa")
             writer.sheets["Resumo"] = ws_r
             writer.sheets["Conciliacao Completa"] = ws
-            df_d_g = df_d.drop_duplicates(subset="Nota", keep="first") if not df_d.empty else pd.DataFrame(columns=["Nota", "Valor", "Codigo"])
-            df_e_g = df_e.drop_duplicates(subset="Nota", keep="first") if not df_e.empty else pd.DataFrame(columns=["Nota", "Valor", "Codigo"])
-            log(f"Notas lidas Dom/Emp: {len(df_d_g)} / {len(df_e_g)}")
+            # A mesma Nota pode aparecer múltiplas vezes (ex.: por CFOP). Conciliação é feita por Nota,
+            # somando os valores para obter o total por documento.
+            df_d_g = agregar_por_nota(df_d) if not df_d.empty else pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+            df_e_g_full = agregar_por_nota(df_e) if not df_e.empty else pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+            log(f"Notas únicas (Dom/Emp): {len(df_d_g)} / {len(df_e_g_full)}")
 
             # Se a empresa tem Status NFE, separa notas inutilizadas (ex.: "I") em aba dedicada.
             df_inutilizadas = pd.DataFrame()
-            df_e_g_all = df_e_g.copy()
+            df_e_g_all = df_e_g_full.copy()
+            df_e_g = df_e_g_full.copy()
             if "Status_NFE" in df_e_g.columns and not df_e_g.empty:
                 status_norm = df_e_g["Status_NFE"].astype(str).str.strip().str.upper()
                 mask_inut = status_norm.eq("I") | status_norm.str.startswith("I ")
