@@ -274,7 +274,7 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
     Emp: Nota col 12, Valor col 17, Data col 10, Status Nfe (quando existir)
     """
     if df_raw is None or df_raw.empty:
-        return pd.DataFrame(columns=["Nota", "Valor", "Data", "Codigo", "Status_NFE"])
+        return pd.DataFrame(columns=["Nota", "Valor", "Data", "Codigo", "Status_NFE", "CFOP"])
 
     def _find_header_row(df: pd.DataFrame, must_have: List[str], max_rows: int = 30) -> Optional[int]:
         lim = min(max_rows, len(df))
@@ -316,7 +316,7 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
     if tipo_origem == "DOMINIO":
         if len(df_raw.columns) <= 22:
             log("[ERRO] DOMINIO: colunas insuficientes")
-            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE", "CFOP"])
         col_nota = next(
             (c for c in df_raw.columns if isinstance(c, str) and c.strip() == "nota"),
             None,
@@ -329,15 +329,20 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
             (c for c in df_raw.columns if isinstance(c, str) and "valor cont" in c),
             None,
         ) or df_raw.columns[20]
+        col_cfop = next(
+            (c for c in df_raw.columns if isinstance(c, str) and "cfop" in c),
+            None,
+        ) or (df_raw.columns[13] if len(df_raw.columns) > 13 else None)
         col_cod = None
         col_status = None
         df_raw = cortar_inicio(df_raw, df_raw.columns.get_loc(col_nota))
         valor_series = df_raw[col_valor]
         data_series = parse_data(df_raw[col_data])
+        cfop_series = df_raw[col_cfop] if col_cfop is not None else ""
     else:
         if len(df_raw.columns) <= 17:
             log("[ERRO] EMPRESA: colunas insuficientes")
-            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE", "CFOP"])
         col_nota = next(
             (c for c in df_raw.columns if isinstance(c, str) and "n.nota" in c),
             None,
@@ -352,6 +357,10 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
             (c for c in df_raw.columns if isinstance(c, str) and ("dt.emiss" in c or "dt.emissão" in c)),
             None,
         ) or df_raw.columns[10]
+        col_cfop = next(
+            (c for c in df_raw.columns if isinstance(c, str) and "cfop" in c),
+            None,
+        )
         col_cod = None
         df_raw = cortar_inicio(df_raw, df_raw.columns.get_loc(col_nota))
         valor_series = df_raw[col_valor]
@@ -363,6 +372,13 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
                 (c for c in df_raw.columns if isinstance(c, str) and "status" in c and "nfe" in c),
                 None,
             )
+        if col_cfop is not None:
+            cfop_series = df_raw[col_cfop]
+        else:
+            # Em alguns relatórios, o CFOP aparece como linha separadora: "CFOP: 5.102"
+            base0 = df_raw.iloc[:, 0].astype(str)
+            extracted = base0.str.extract(r"CFOP:\\s*([\\d\\.]+)", expand=False)
+            cfop_series = extracted.ffill().fillna("")
 
     try:
         df_new = pd.DataFrame({
@@ -378,9 +394,10 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
             df_new["Status_NFE"] = df_raw[col_status]
         else:
             df_new["Status_NFE"] = ""
+        df_new["CFOP"] = cfop_series
     except Exception as exc:
         log(f"[ERRO] Recorte de colunas: {exc}")
-        return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+        return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE", "CFOP"])
 
     df_new["Nota"] = df_new["Nota"].apply(normalizar_nota)
     df_new["Valor"] = df_new["Valor"].apply(converter_para_float)
@@ -545,6 +562,42 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
         )
         return grouped[["Codigo", "Nota", "Valor", "Data", "Status_NFE"]]
 
+    def normalizar_cfop(val) -> str:
+        if pd.isna(val):
+            return ""
+        s = str(val).strip().upper()
+        if not s or s == "NAN":
+            return ""
+        # mantém apenas dígitos e ponto (ex.: 5.102)
+        s2 = re.sub(r"[^0-9.]", "", s)
+        return s2 or ""
+
+    def agregar_por_nota_cfop(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["CFOP", "Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+        out = df.copy()
+        for c in ["Codigo", "Nota", "Valor", "Data", "Status_NFE", "CFOP"]:
+            if c not in out.columns:
+                out[c] = ""
+        out["CFOP"] = out["CFOP"].apply(normalizar_cfop)
+
+        def first_non_empty(series: pd.Series):
+            for v in series:
+                if pd.notna(v) and str(v).strip() != "":
+                    return v
+            return ""
+
+        grouped = (
+            out.groupby(["CFOP", "Nota"], as_index=False)
+            .agg(
+                Valor=("Valor", "sum"),
+                Data=("Data", "min"),
+                Codigo=("Codigo", first_non_empty),
+                Status_NFE=("Status_NFE", first_non_empty),
+            )
+        )
+        return grouped[["CFOP", "Codigo", "Nota", "Valor", "Data", "Status_NFE"]]
+
     # Saida agora na pasta da empresa: .../RELATORIO RPA - <empresa>/Conciliacao
     out_dir = path_rpa / "Conciliacao"
     os.makedirs(out_dir, exist_ok=True)
@@ -580,6 +633,10 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
             df_d_g = agregar_por_nota(df_d) if not df_d.empty else pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
             df_e_g_full = agregar_por_nota(df_e) if not df_e.empty else pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
             log(f"Notas únicas (Dom/Emp): {len(df_d_g)} / {len(df_e_g_full)}")
+
+            # Versão por CFOP (abas para consulta)
+            df_d_cfop = agregar_por_nota_cfop(df_d) if not df_d.empty else pd.DataFrame(columns=["CFOP", "Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+            df_e_cfop_full = agregar_por_nota_cfop(df_e) if not df_e.empty else pd.DataFrame(columns=["CFOP", "Codigo", "Nota", "Valor", "Data", "Status_NFE"])
 
             # Se a empresa tem Status NFE, separa notas inutilizadas (ex.: "I") em aba dedicada.
             df_inutilizadas = pd.DataFrame()
@@ -707,6 +764,85 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
                 ws2.set_column("C:C", 14, fmt_date)
                 ws2.set_column("D:D", 18, fmt_m)
                 ws2.set_column("E:E", 12, fmt_text)
+
+            # Abas por CFOP (consulta)
+            cfops = sorted({c for c in df_d_cfop["CFOP"].dropna().unique().tolist() if str(c).strip()} | {c for c in df_e_cfop_full["CFOP"].dropna().unique().tolist() if str(c).strip()})
+            if cfops:
+                for cfop in cfops:
+                    sheet_name = f"CFOP {cfop}"
+                    if len(sheet_name) > 31:
+                        sheet_name = sheet_name[:31]
+
+                    d_sub = df_d_cfop.loc[df_d_cfop["CFOP"] == cfop].copy()
+                    e_sub = df_e_cfop_full.loc[df_e_cfop_full["CFOP"] == cfop].copy()
+
+                    # separa inutilizadas também no recorte do CFOP
+                    inutil_sub = pd.DataFrame()
+                    if not e_sub.empty and "Status_NFE" in e_sub.columns:
+                        st = e_sub["Status_NFE"].astype(str).str.strip().str.upper()
+                        m_inut = st.eq("I") | st.str.startswith("I ")
+                        if m_inut.any():
+                            inutil_sub = e_sub.loc[m_inut].copy()
+                            e_sub = e_sub.loc[~m_inut].copy()
+
+                    df_cf = pd.merge(
+                        d_sub.rename(columns={"Valor": "Valor_Dom", "Codigo": "Codigo_Dom"})[["Nota", "Valor_Dom", "Codigo_Dom"]],
+                        e_sub.rename(columns={"Valor": "Valor_Emp", "Codigo": "Codigo_Emp"})[["Nota", "Valor_Emp", "Codigo_Emp"]],
+                        on="Nota",
+                        how="outer",
+                        indicator=True,
+                    )
+                    df_cf["Valor_Dom"] = df_cf["Valor_Dom"].fillna(0.0)
+                    df_cf["Valor_Emp"] = df_cf["Valor_Emp"].fillna(0.0)
+                    df_cf["Codigo"] = df_cf.get("Codigo_Dom", pd.Series()).fillna(df_cf.get("Codigo_Emp", ""))
+                    df_cf["Diferenca"] = df_cf["Valor_Dom"] - df_cf["Valor_Emp"]
+                    df_cf["Status"] = df_cf.apply(
+                        lambda r: "So Dominio"
+                        if r["_merge"] == "left_only"
+                        else ("So Empresa" if r["_merge"] == "right_only" else ("Divergencia Valor" if abs(r["Diferenca"]) > 0.05 else "OK")),
+                        axis=1,
+                    )
+                    df_cf = df_cf[["Codigo", "Nota", "Valor_Dom", "Valor_Emp", "Diferenca", "Status"]]
+
+                    if not inutil_sub.empty:
+                        n_inut = len(inutil_sub)
+                        cod_inut = inutil_sub["Codigo"] if "Codigo" in inutil_sub.columns else pd.Series([""] * n_inut)
+                        nota_inut = inutil_sub["Nota"] if "Nota" in inutil_sub.columns else pd.Series([""] * n_inut)
+                        val_inut = inutil_sub["Valor"] if "Valor" in inutil_sub.columns else pd.Series([0.0] * n_inut)
+                        df_inut_cf = pd.DataFrame(
+                            {
+                                "Codigo": cod_inut,
+                                "Nota": nota_inut,
+                                "Valor_Dom": 0.0,
+                                "Valor_Emp": val_inut,
+                                "Diferenca": 0.0 - val_inut,
+                                "Status": "Inutilizada",
+                            }
+                        )
+                        df_cf = pd.concat([df_cf, df_inut_cf], ignore_index=True)
+
+                    try:
+                        df_cf["k"] = pd.to_numeric(df_cf["Nota"], errors="coerce")
+                        df_cf.sort_values("k", inplace=True)
+                        df_cf.drop(columns="k", inplace=True)
+                    except Exception:
+                        pass
+
+                    df_cf.to_excel(writer, index=False, sheet_name=sheet_name)
+                    ws_cf = writer.sheets[sheet_name]
+                    ws_cf.set_row(0, 22)
+                    for col_idx, col_name in enumerate(df_cf.columns.tolist()):
+                        ws_cf.write(0, col_idx, col_name, fmt_header)
+                    ws_cf.freeze_panes(1, 0)
+                    ws_cf.autofilter(0, 0, max(0, len(df_cf)), max(0, len(df_cf.columns) - 1))
+                    ws_cf.set_column("A:A", 14, fmt_text)
+                    ws_cf.set_column("B:B", 12, fmt_text)
+                    ws_cf.set_column("C:E", 18, fmt_m)
+                    ws_cf.set_column("F:F", 22, fmt_text)
+                    ws_cf.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "Divergencia", "format": fmt_r})
+                    ws_cf.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "So Dominio", "format": fmt_y})
+                    ws_cf.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "So Empresa", "format": fmt_b})
+                    ws_cf.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "Inutilizada", "format": fmt_b})
         log(f"Consolidado salvo: {fout}")
     except Exception as exc:
         log(f"[ERRO SALVAR] {exc}")
