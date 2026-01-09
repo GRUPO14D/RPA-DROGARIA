@@ -7,6 +7,7 @@ import subprocess
 import configparser
 from utils import resource_path
 from pathlib import Path
+from numbers import Integral
 from typing import Callable, Optional, List, Dict
 
 import pandas as pd
@@ -157,10 +158,11 @@ def normalizar_nota(nota):
 def preencher_mesclados(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
-    try:
-        return df.ffill()
-    except Exception:
-        return df
+    # Atenção: forward-fill ("ffill") em relatórios do Domínio/Empresa pode "colar" o número da Nota
+    # nas linhas de TOTAL/rodapé (onde a coluna Nota vem vazia), fazendo esses totais entrarem na conciliação.
+    # Preferimos não preencher automaticamente; as colunas usadas (Nota/Valor/Data/Status) já são lidas das linhas
+    # válidas e as linhas de total são descartadas pelo parser.
+    return df
 
 
 def parse_data(col) -> pd.Series:
@@ -267,19 +269,43 @@ def cortar_inicio(df: pd.DataFrame, col_nota_idx: int) -> pd.DataFrame:
 
 def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
     """
-    Titulos na linha 6 (indice 5).
+    Detecta cabecalho e recorta colunas relevantes.
     Dom: Nota col 4, Valor col 20, Data col 2
-    Emp: Nota col 12, Valor col 17, Data col 10
+    Emp: Nota col 12, Valor col 17, Data col 10, Status Nfe (quando existir)
     """
     if df_raw is None or df_raw.empty:
-        return pd.DataFrame(columns=["Nota", "Valor"])
+        return pd.DataFrame(columns=["Nota", "Valor", "Data", "Codigo", "Status_NFE"])
 
-    if isinstance(df_raw.columns[0], int):
+    def _find_header_row(df: pd.DataFrame, must_have: List[str], max_rows: int = 30) -> Optional[int]:
+        lim = min(max_rows, len(df))
+        for i in range(lim):
+            row = df.iloc[i].astype(str).str.lower()
+            if all(row.str.contains(t, na=False, regex=False).any() for t in must_have):
+                return i
+        return None
+
+    if isinstance(df_raw.columns[0], Integral):
+        # Alguns relatórios do Domínio vêm com cabeçalho em linha fixa (5),
+        # e alguns relatórios de Empresa trazem cabeçalho por volta da linha 3.
         if len(df_raw) <= 6:
             log("[ERRO] Planilha sem linhas suficientes para cabecalho")
-            return pd.DataFrame(columns=["Codigo", "Nota", "Valor"])
-        df_raw.columns = df_raw.iloc[5].astype(str).str.lower().str.strip()
-        df_raw = df_raw.iloc[6:].reset_index(drop=True)
+            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+
+        if tipo_origem == "EMPRESA":
+            header_idx = _find_header_row(df_raw, must_have=["n.nota", "status nfe"], max_rows=20)
+            if header_idx is None:
+                header_idx = _find_header_row(df_raw, must_have=["n.nota", "status"], max_rows=25)
+            if header_idx is None:
+                header_idx = _find_header_row(df_raw, must_have=["nota", "status"], max_rows=25)
+            if header_idx is None:
+                header_idx = 5
+        else:
+            header_idx = _find_header_row(df_raw, must_have=["nota", "valor"], max_rows=20)
+            if header_idx is None:
+                header_idx = 5
+
+        df_raw.columns = df_raw.iloc[header_idx].astype(str).str.lower().str.strip()
+        df_raw = df_raw.iloc[header_idx + 1 :].reset_index(drop=True)
     else:
         df_raw.columns = df_raw.columns.astype(str).str.lower().str.strip()
 
@@ -290,25 +316,53 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
     if tipo_origem == "DOMINIO":
         if len(df_raw.columns) <= 22:
             log("[ERRO] DOMINIO: colunas insuficientes")
-            return pd.DataFrame(columns=["Codigo", "Nota", "Valor"])
-        col_nota = df_raw.columns[4]
-        col_valor = df_raw.columns[20]
-        col_data = df_raw.columns[2]
+            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+        col_nota = next(
+            (c for c in df_raw.columns if isinstance(c, str) and c.strip() == "nota"),
+            None,
+        ) or df_raw.columns[4]
+        col_data = next(
+            (c for c in df_raw.columns if isinstance(c, str) and c.strip() == "data"),
+            None,
+        ) or df_raw.columns[2]
+        col_valor = next(
+            (c for c in df_raw.columns if isinstance(c, str) and "valor cont" in c),
+            None,
+        ) or df_raw.columns[20]
         col_cod = None
+        col_status = None
         df_raw = cortar_inicio(df_raw, df_raw.columns.get_loc(col_nota))
         valor_series = df_raw[col_valor]
         data_series = parse_data(df_raw[col_data])
     else:
         if len(df_raw.columns) <= 17:
             log("[ERRO] EMPRESA: colunas insuficientes")
-            return pd.DataFrame(columns=["Codigo", "Nota", "Valor"])
-        col_nota = df_raw.columns[12]
-        col_valor = df_raw.columns[17]
-        col_data = df_raw.columns[10]
+            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+        col_nota = next(
+            (c for c in df_raw.columns if isinstance(c, str) and "n.nota" in c),
+            None,
+        ) or df_raw.columns[12]
+        # Preferência: "Total Nota" (valor total do documento). Se não existir, tenta "Total Produtos".
+        col_valor = (
+            next((c for c in df_raw.columns if isinstance(c, str) and "total nota" in c), None)
+            or next((c for c in df_raw.columns if isinstance(c, str) and "total produtos" in c), None)
+            or (df_raw.columns[17] if len(df_raw.columns) > 17 else df_raw.columns[-1])
+        )
+        col_data = next(
+            (c for c in df_raw.columns if isinstance(c, str) and ("dt.emiss" in c or "dt.emissão" in c)),
+            None,
+        ) or df_raw.columns[10]
         col_cod = None
         df_raw = cortar_inicio(df_raw, df_raw.columns.get_loc(col_nota))
         valor_series = df_raw[col_valor]
         data_series = parse_data(df_raw[col_data])
+        # Status NFe fica na coluna U (indice 20) no relatório Empresa.
+        col_status = df_raw.columns[20] if len(df_raw.columns) > 20 else None
+        if col_status is None:
+            col_status = next(
+                (c for c in df_raw.columns if isinstance(c, str) and "status" in c and "nfe" in c),
+                None,
+            )
 
     try:
         df_new = pd.DataFrame({
@@ -320,9 +374,13 @@ def preparar_dataframe(df_raw: pd.DataFrame, tipo_origem: str) -> pd.DataFrame:
             df_new["Codigo"] = df_raw[col_cod]
         else:
             df_new["Codigo"] = ""
+        if col_status:
+            df_new["Status_NFE"] = df_raw[col_status]
+        else:
+            df_new["Status_NFE"] = ""
     except Exception as exc:
         log(f"[ERRO] Recorte de colunas: {exc}")
-        return pd.DataFrame(columns=["Codigo", "Nota", "Valor"])
+        return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
 
     df_new["Nota"] = df_new["Nota"].apply(normalizar_nota)
     df_new["Valor"] = df_new["Valor"].apply(converter_para_float)
@@ -462,6 +520,31 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
         log("[ERRO] Dados insuficientes.")
         return
 
+    def agregar_por_nota(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+        out = df.copy()
+        for c in ["Codigo", "Nota", "Valor", "Data", "Status_NFE"]:
+            if c not in out.columns:
+                out[c] = ""
+
+        def first_non_empty(series: pd.Series):
+            for v in series:
+                if pd.notna(v) and str(v).strip() != "":
+                    return v
+            return ""
+
+        grouped = (
+            out.groupby("Nota", as_index=False)
+            .agg(
+                Valor=("Valor", "sum"),
+                Data=("Data", "min"),
+                Codigo=("Codigo", first_non_empty),
+                Status_NFE=("Status_NFE", first_non_empty),
+            )
+        )
+        return grouped[["Codigo", "Nota", "Valor", "Data", "Status_NFE"]]
+
     # Saida agora na pasta da empresa: .../RELATORIO RPA - <empresa>/Conciliacao
     out_dir = path_rpa / "Conciliacao"
     os.makedirs(out_dir, exist_ok=True)
@@ -469,9 +552,50 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
 
     try:
         with pd.ExcelWriter(fout, engine="xlsxwriter") as writer:
-            df_d_g = df_d.drop_duplicates(subset="Nota", keep="first") if not df_d.empty else pd.DataFrame(columns=["Nota", "Valor", "Codigo"])
-            df_e_g = df_e.drop_duplicates(subset="Nota", keep="first") if not df_e.empty else pd.DataFrame(columns=["Nota", "Valor", "Codigo"])
-            log(f"Notas lidas Dom/Emp: {len(df_d_g)} / {len(df_e_g)}")
+            wb = writer.book
+            fmt_header = wb.add_format(
+                {
+                    "bold": True,
+                    "bg_color": "#D9E1F2",
+                    "border": 1,
+                    "text_wrap": True,
+                    "align": "center",
+                    "valign": "vcenter",
+                }
+            )
+            fmt_text = wb.add_format({"text_wrap": True, "align": "center", "valign": "vcenter"})
+            fmt_date = wb.add_format({"num_format": "dd/mm/yyyy", "align": "center", "valign": "vcenter"})
+            fmt_m = wb.add_format({"num_format": "#,##0.00", "align": "center", "valign": "vcenter"})
+            fmt_r = wb.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006", "align": "center", "valign": "vcenter"})
+            fmt_y = wb.add_format({"bg_color": "#FFEB9C", "font_color": "#9C6500", "align": "center", "valign": "vcenter"})
+            fmt_b = wb.add_format({"bg_color": "#BDD7EE", "font_color": "#000000", "align": "center", "valign": "vcenter"})
+
+            # Ordem das abas: Resumo -> Conciliacao Completa -> Inutilizadas
+            ws_r = wb.add_worksheet("Resumo")
+            ws = wb.add_worksheet("Conciliacao Completa")
+            writer.sheets["Resumo"] = ws_r
+            writer.sheets["Conciliacao Completa"] = ws
+            # A mesma Nota pode aparecer múltiplas vezes (ex.: por CFOP). Conciliação é feita por Nota,
+            # somando os valores para obter o total por documento.
+            df_d_g = agregar_por_nota(df_d) if not df_d.empty else pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+            df_e_g_full = agregar_por_nota(df_e) if not df_e.empty else pd.DataFrame(columns=["Codigo", "Nota", "Valor", "Data", "Status_NFE"])
+            log(f"Notas únicas (Dom/Emp): {len(df_d_g)} / {len(df_e_g_full)}")
+
+            # Se a empresa tem Status NFE, separa notas inutilizadas (ex.: "I") em aba dedicada.
+            df_inutilizadas = pd.DataFrame()
+            df_e_g_all = df_e_g_full.copy()
+            df_e_g = df_e_g_full.copy()
+            if "Status_NFE" in df_e_g.columns and not df_e_g.empty:
+                status_norm = df_e_g["Status_NFE"].astype(str).str.strip().str.upper()
+                mask_inut = status_norm.eq("I") | status_norm.str.startswith("I ")
+                if mask_inut.any():
+                    df_inutilizadas = df_e_g.loc[mask_inut].copy()
+                    df_e_g = df_e_g.loc[~mask_inut].copy()
+
+                    notas_inut = set(df_inutilizadas["Nota"].astype(str))
+                    if "Nota" in df_d_g.columns and not df_d_g.empty:
+                        df_d_g = df_d_g.loc[~df_d_g["Nota"].astype(str).isin(notas_inut)].copy()
+                    log(f"Notas inutilizadas (empresa): {len(df_inutilizadas)}")
 
             df_final = pd.merge(df_d_g, df_e_g, on="Nota", how="outer", suffixes=("_Dom", "_Emp"), indicator=True)
             df_final["Valor_Dom"] = df_final["Valor_Dom"].fillna(0.0)
@@ -488,6 +612,24 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
             cols_finais = ["Codigo", "Nota", "Valor_Dom", "Valor_Emp", "Diferenca", "Status"]
             df_final = df_final[[c for c in cols_finais if c in df_final.columns]]
 
+            # Reinsere inutilizadas no Resultado com status próprio (para não aparecer como "So Empresa")
+            if not df_inutilizadas.empty:
+                n_inut = len(df_inutilizadas)
+                cod_inut = df_inutilizadas["Codigo"] if "Codigo" in df_inutilizadas.columns else pd.Series([""] * n_inut)
+                nota_inut = df_inutilizadas["Nota"] if "Nota" in df_inutilizadas.columns else pd.Series([""] * n_inut)
+                val_inut = df_inutilizadas["Valor"] if "Valor" in df_inutilizadas.columns else pd.Series([0.0] * n_inut)
+                df_inut_res = pd.DataFrame(
+                    {
+                        "Codigo": cod_inut,
+                        "Nota": nota_inut,
+                        "Valor_Dom": 0.0,
+                        "Valor_Emp": val_inut,
+                        "Diferenca": 0.0 - val_inut,
+                        "Status": "Inutilizada",
+                    }
+                )
+                df_final = pd.concat([df_final, df_inut_res], ignore_index=True)
+
             try:
                 df_final["k"] = pd.to_numeric(df_final["Nota"])
                 df_final.sort_values("k", inplace=True)
@@ -495,18 +637,77 @@ def processar_empresa(empresa: str, pasta_base: str, mes_ano: str, arquivo_dom: 
             except Exception:
                 df_final.sort_values("Nota", inplace=True)
 
-            df_final.to_excel(writer, index=False, sheet_name="Resultado")
-            wb, ws = writer.book, writer.sheets["Resultado"]
-            fmt_m = wb.add_format({"num_format": "#,##0.00"})
-            fmt_r = wb.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006"})
-            fmt_y = wb.add_format({"bg_color": "#FFEB9C", "font_color": "#9C6500"})
-            fmt_b = wb.add_format({"bg_color": "#BDD7EE", "font_color": "#000000"})
-            ws.set_column("A:B", 12)
+            # Aba de resumo para leitura rápida
+            total_resultado = len(df_final)
+            qtd_inutilizadas = int((df_final["Status"] == "Inutilizada").sum()) if "Status" in df_final.columns else 0
+            qtd_so_empresa = int((df_final["Status"] == "So Empresa").sum()) if "Status" in df_final.columns else 0
+            qtd_so_dominio = int((df_final["Status"] == "So Dominio").sum()) if "Status" in df_final.columns else 0
+            qtd_ok = int((df_final["Status"] == "OK").sum()) if "Status" in df_final.columns else 0
+            qtd_div = int((df_final["Status"] == "Divergencia Valor").sum()) if "Status" in df_final.columns else 0
+
+            df_resumo = pd.DataFrame(
+                [
+                    ["Empresa", empresa],
+                    ["Mes/Ano", mes_ano],
+                    ["Notas (Conciliacao Completa)", total_resultado],
+                    ["Inutilizadas", qtd_inutilizadas],
+                    ["So Empresa", qtd_so_empresa],
+                    ["So Dominio", qtd_so_dominio],
+                    ["OK", qtd_ok],
+                    ["Divergencia Valor", qtd_div],
+                    ["Notas lidas (Dom/Emp)", f"{len(df_d_g)} / {len(df_e_g_all)}"],
+                ],
+                columns=["Item", "Valor"],
+            )
+            df_resumo.to_excel(writer, index=False, sheet_name="Resumo")
+            ws_r.set_row(0, 22)
+            ws_r.write(0, 0, "Item", fmt_header)
+            ws_r.write(0, 1, "Valor", fmt_header)
+            ws_r.freeze_panes(1, 0)
+            ws_r.autofilter(0, 0, max(0, len(df_resumo)), 1)
+            ws_r.set_column("A:A", 28, fmt_text)
+            ws_r.set_column("B:B", 40, fmt_text)
+
+            # Aba principal (conciliacao completa)
+            df_final.to_excel(writer, index=False, sheet_name="Conciliacao Completa")
+            ws.set_row(0, 22)
+            for col_idx, col_name in enumerate(df_final.columns.tolist()):
+                ws.write(0, col_idx, col_name, fmt_header)
+            ws.freeze_panes(1, 0)
+            ws.autofilter(0, 0, max(0, len(df_final)), max(0, len(df_final.columns) - 1))
+
+            ws.set_column("A:A", 14, fmt_text)
+            ws.set_column("B:B", 12, fmt_text)
             ws.set_column("C:E", 18, fmt_m)
-            ws.set_column("F:F", 25)
+            ws.set_column("F:F", 22, fmt_text)
             ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "Divergencia", "format": fmt_r})
             ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "So Dominio", "format": fmt_y})
             ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "So Empresa", "format": fmt_b})
+            ws.conditional_format("F2:F9999", {"type": "text", "criteria": "containing", "value": "Inutilizada", "format": fmt_b})
+
+            if not df_inutilizadas.empty:
+                ws2 = wb.add_worksheet("Inutilizadas")
+                writer.sheets["Inutilizadas"] = ws2
+                cols_inut = ["Codigo", "Nota", "Data", "Valor", "Status_NFE"]
+                df_inut_out = df_inutilizadas[[c for c in cols_inut if c in df_inutilizadas.columns]].copy()
+                try:
+                    df_inut_out["k"] = pd.to_numeric(df_inut_out["Nota"], errors="coerce")
+                    df_inut_out.sort_values("k", inplace=True)
+                    df_inut_out.drop(columns="k", inplace=True)
+                except Exception:
+                    pass
+                df_inut_out.to_excel(writer, index=False, sheet_name="Inutilizadas")
+                ws2.set_row(0, 22)
+                for col_idx, col_name in enumerate(df_inut_out.columns.tolist()):
+                    ws2.write(0, col_idx, col_name, fmt_header)
+                ws2.freeze_panes(1, 0)
+                ws2.autofilter(0, 0, max(0, len(df_inut_out)), max(0, len(df_inut_out.columns) - 1))
+                ws2.set_column("A:A", 14, fmt_text)
+                ws2.set_column("B:B", 12, fmt_text)
+                ws2.set_column("C:C", 14, fmt_date)
+                ws2.set_column("D:D", 18, fmt_m)
+                ws2.set_column("E:E", 12, fmt_text)
+
         log(f"Consolidado salvo: {fout}")
     except Exception as exc:
         log(f"[ERRO SALVAR] {exc}")
