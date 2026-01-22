@@ -24,3 +24,11 @@ Thumbs.db
 *.py[cod]
 *$py.class
 .Python
+
+# Local ignores (Codex)
+.idea/
+.vscode/
+build/
+dist/
+.env
+desktop.ini
